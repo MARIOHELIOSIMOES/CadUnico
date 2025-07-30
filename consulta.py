@@ -1,6 +1,7 @@
 import csv
 import cx_Oracle
 import getpass
+import os
 from datetime import datetime
 
 #Função auxiliar para limpar CPF
@@ -408,15 +409,22 @@ def process_csv_with_oracle_data(csv_file_path, output_file_path_total):
 
    
 
+def atualizarCaminho(caminho):
+    datahora = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Cria o diretório se não existir
+    os.makedirs(datahora, exist_ok=True)
+    # Retorna o novo caminho completo
+    return os.path.join(datahora, caminho)
+
 if __name__ == "__main__":
     # nome dos arquivos de saida
     input_csv = 'cadunico.csv'
-    output_cpf_log = 'cpf_log.txt'
-    output_csv = 'dados_com_cdc_total.csv'
-    output_match_cdc_csv = 'cdc_confirmados.csv'
-    output_cdc_desatualizado = 'cpf_com_cdc_desatualizados.csv'
-    output_cdc_estimado = 'cpf_com_cdc_estimado_pelo_cep.csv'
-    output_base_saae_social = 'base_saae_social'
+    output_cpf_log = atualizarCaminho('cpf_log.txt')
+    output_csv = atualizarCaminho('dados_com_cdc_total.csv')
+    output_match_cdc_csv = atualizarCaminho('cdc_confirmados.csv')
+    output_cdc_desatualizado = atualizarCaminho('cpf_com_cdc_desatualizados.csv')
+    output_cdc_estimado = atualizarCaminho('cpf_com_cdc_estimado_pelo_cep.csv')
+    output_base_saae_social = atualizarCaminho('base_saae_social')
     server = '192.168.3.250'
     porta = '1521'
     banco = 'ORCL'
