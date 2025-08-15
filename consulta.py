@@ -3,6 +3,10 @@ import cx_Oracle
 import getpass
 import os
 from datetime import datetime
+from collections import defaultdict
+
+
+
 
 #Função auxiliar para limpar CPF
 def clean_cpf(cpf):
@@ -136,48 +140,44 @@ def gravar_cadastro_social_saae_log(output_base_path, lista_cadastro_social_saae
             
             csv_file.write(f"{cdc};{status};{mensagem}\n")
 
-
-# Função Principal para processar o CSV combinando com dados do Oracle
 def process_csv_with_oracle_data(csv_file_path, output_file_path_total):
-    """Processa o arquivo CSV combinando com dados do Oracle"""
+    """Processa o arquivo CSV combinando com dados do Oracle (CPF pode ter múltiplos CDCs)."""
+    # --- Entradas de credenciais ---
     inputUsuario = input("Digite o usuário do Banco de Dados: ")
     inputSenha = getpass.getpass('Digite a senha do usuário: ')  
-    
-    # Obter dados do Oracle
-    oracle_data = get_data_from_oracle(inputUsuario, inputSenha)
-    
-    # Criar dicionário de mapeamento CPF -> CDC
-    cpf_to_cdc = {}
-    cdc_to_categoria = {}
-    cdc_to_cadastro_social = {}
-    #cdc_cadastro_social = {}
-    cdc_count = {}
-    cpf_samples_from_oracle = set()  # Para armazenar amostras de CPFs do Oracle
-    
-    # Criar dicionário de mapeamento CEP+NÚMERO -> CDC
-    cep_numero_to_cdc = {}
 
-    # Inicializar estatísticas
+    # --- Obter dados do Oracle ---
+    oracle_data = get_data_from_oracle(inputUsuario, inputSenha)
+
+    # --- Estruturas de mapeamento ---
+    cpf_to_cdcs = defaultdict(set)   # CPF -> {CDC1, CDC2, ...}
+    cdc_to_categoria = {}            # CDC -> categoria
+    cdc_count = defaultdict(int)     # CDC -> número de CPFs relacionados (contagem de relacionamentos únicos CPF-CDC)
+    cpf_samples_from_oracle = set()  # amostras de CPFs do Oracle
+    cep_numero_to_cdc = {}           # (CEP, NUMERO) -> CDC
+    cdc_to_cadastro_social = {}      # CDC -> bool (se é categoria 11)
+
+    # --- Estatísticas iniciais (algumas serão calculadas ao final do carregamento) ---
     stats = {
         'total_cpfs_no_csv': 0,
         'cpfs_com_cdc_encontrado': 0,
         'cpfs_sem_cdc_encontrado': 0,
-        'cdcs_unicos_encontrados': len(set(cpf_to_cdc.values())),
-        'total_relacionamentos_cpf_cdc': len(cpf_to_cdc),
+        'cdcs_unicos_encontrados': 0,              # calculado após carregar Oracle
+        'total_relacionamentos_cpf_cdc': 0,        # calculado após carregar Oracle
         'cdc_count': cdc_count,
         'cdc_match_count': 0,
         'cdc_cadastro_social_count': 0,
         'cdc_estimado_cadastro_social_count': 0,
         'cep_numero_invalidos': 0,
         'cpfs_nao_encontrados_samples': set(),
-        'cpfs_oracle_samples': list(cpf_samples_from_oracle)[:10],  # Pega 10 amostras
+        'cpfs_oracle_samples': [],                 # preenchido ao final da carga do Oracle
         'cdcs_estimados_por_cep_numero': 0,
         'cdc_cadastro_social_desatualizado_count': 0,
         'cdc_cadastro_social_correto_count': 0,
         'cdc_incluir_cadastro_social_count': 0
     }
 
-
+    # --- Carregar mapeamentos a partir do Oracle ---
     for row in oracle_data:
         cdc = row['CDC']
         cpf_proprietario = row['CPF_PROPRIETARIO']
@@ -185,172 +185,193 @@ def process_csv_with_oracle_data(csv_file_path, output_file_path_total):
         cep = row['CEP']
         numero_imovel = row['NUMERO_IMOVEL']
         cod_categoria = row['COD_CATEGORIA']
-        
-        
-        # Processar CPF do proprietário
+
+        # Proprietário
         if cpf_proprietario:
             cpf_proprietario_clean = clean_cpf(cpf_proprietario)
-            if len(cpf_proprietario_clean) == 11:  # CPF válido
-                cpf_to_cdc[cpf_proprietario_clean] = cdc
-                cdc_count[cdc] = cdc_count.get(cdc, 0) + 1
+            if len(cpf_proprietario_clean) == 11:
+                if cdc not in cpf_to_cdcs[cpf_proprietario_clean]:
+                    cpf_to_cdcs[cpf_proprietario_clean].add(cdc)
+                    cdc_count[cdc] += 1
                 cpf_samples_from_oracle.add(cpf_proprietario_clean)
                 cdc_to_categoria[cdc] = cod_categoria
-        
-        # Processar CPF do usuário
+
+        # Usuário
         if cpf_usuario:
             cpf_usuario_clean = clean_cpf(cpf_usuario)
-            if len(cpf_usuario_clean) == 11:  # CPF válido
-                cpf_to_cdc[cpf_usuario_clean] = cdc
-                cdc_count[cdc] = cdc_count.get(cdc, 0) + 1
+            if len(cpf_usuario_clean) == 11:
+                if cdc not in cpf_to_cdcs[cpf_usuario_clean]:
+                    cpf_to_cdcs[cpf_usuario_clean].add(cdc)
+                    cdc_count[cdc] += 1
                 cpf_samples_from_oracle.add(cpf_usuario_clean)
                 cdc_to_categoria[cdc] = cod_categoria
-        
-        # Processar CEP e número do imóvel para mapeamento
+
+        # (CEP, Número) -> CDC
         if cep and numero_imovel:
             cep_clean = str(cep).strip()
             numero_clean = str(numero_imovel).strip()
             cep_numero_key = (cep_clean, numero_clean)
             cep_numero_to_cdc[cep_numero_key] = cdc
 
+        # Marcar CDCs de categoria 11 como "tem cadastro social"
         if cod_categoria == 11:
-            cdc_to_cadastro_social[cdc] = False
-            stats['cdc_cadastro_social_count'] += 1 
-    
-    
-    
-    # Processar arquivo CSV
-    with open(input_csv, mode='r', encoding='utf-8') as csv_file, \
-        open(output_csv, mode='w', encoding='utf-8', newline='') as total_file, \
-        open(output_match_cdc_csv, mode='w', encoding='utf-8', newline='') as match_file, \
-        open(output_cdc_desatualizado, mode='w', encoding='utf-8', newline='') as desatualizado_file, \
-        open(output_cdc_estimado, mode='w', encoding='utf-8', newline='') as estimado_file:
-    
+            cdc_to_cadastro_social[cdc] = True
+        else:
+            cdc_to_cadastro_social.setdefault(cdc, False)
+
+    # Estatísticas após carregar Oracle
+    todos_cdcs = set()
+    total_relacionamentos = 0
+    for s in cpf_to_cdcs.values():
+        todos_cdcs |= s
+        total_relacionamentos += len(s)
+    stats['cdcs_unicos_encontrados'] = len(todos_cdcs)
+    stats['total_relacionamentos_cpf_cdc'] = total_relacionamentos
+    stats['cpfs_oracle_samples'] = list(cpf_samples_from_oracle)[:10]
+
+    # --- Processar CSV de entrada ---
+    with open(csv_file_path, mode='r', encoding='utf-8') as csv_file, \
+         open(output_file_path_total, mode='w', encoding='utf-8', newline='') as total_file, \
+         open(output_match_cdc_csv, mode='w', encoding='utf-8', newline='') as match_file, \
+         open(output_cdc_desatualizado, mode='w', encoding='utf-8', newline='') as desatualizado_file, \
+         open(output_cdc_estimado, mode='w', encoding='utf-8', newline='') as estimado_file:
+
         reader = csv.DictReader(csv_file)
-        
-        # Definir novos cabeçalhos (incluindo CDC, CADASTRO SOCIAL e CPF_ENCONTRADO, CDC_ESTIMADO e CADASTRO SOCIAL ESTIMADO, e CDC_CONFIRMADO)
-        fieldnames = ['STATUS','CDC', 'CPF_ENCONTRADO', 'CADASTRO SOCIAL', 'CDC_ESTIMADO','CADASTRO SOCIAL ESTIMADO', 'CDC_CONFIRMADO'] + [f for f in reader.fieldnames if f not in ['CDC', 'encontrado', 'CDC_ESTIMADO']]
-        
-        # Criar writers para todos os arquivos de saída
+
+        # Cabeçalhos de saída
+        fieldnames = [
+            'STATUS', 'CDC', 'CPF_ENCONTRADO',
+            'CADASTRO SOCIAL', 'CDC_ESTIMADO',
+            'CADASTRO SOCIAL ESTIMADO', 'CDC_CONFIRMADO'
+        ] + [f for f in reader.fieldnames if f not in ['CDC', 'encontrado', 'CDC_ESTIMADO']]
+
         total_writer = csv.DictWriter(total_file, fieldnames=fieldnames)
         match_writer = csv.DictWriter(match_file, fieldnames=fieldnames)
         desatualizado_writer = csv.DictWriter(desatualizado_file, fieldnames=fieldnames)
         estimado_writer = csv.DictWriter(estimado_file, fieldnames=fieldnames)
-        
-        # Escrever cabeçalhos em todos os arquivos
+
         total_writer.writeheader()
         match_writer.writeheader()
         desatualizado_writer.writeheader()
         estimado_writer.writeheader()
-        
+
         for row in reader:
             stats['total_cpfs_no_csv'] += 1
-            # Limpar e padronizar CPF
-            cpf = clean_cpf(row['p.num_cpf_pessoa'])
-            # Verificar se CPF existe no mapeamento
-            cdc = cpf_to_cdc.get(cpf, '')
-            # Determinar se foi encontrado
-            encontrado = 'sim' if cdc else 'nao'
-            # Inicializar CDC estimado
-            cdc_estimado = ''
-            # Inicializar CDC_Match 
-            cdc_match = 'nao'
-            # Inicializar CDC_Cadastro_Social
-            cdc_cadastro_social = 'nao'
-            # Inicializar CDC_Estimado_Cadastro_Social
-            cdc_estimado_cadastro_social = 'nao'
-            #Buscar CEP e Numero no CSV para o mapeamento
+
+            # CPF limpo do CSV
+            cpf = clean_cpf(row.get('p.num_cpf_pessoa', ''))
+
+            # CDCs (conjunto) para o CPF
+            cdcs_do_cpf = cpf_to_cdcs.get(cpf, set())
+            encontrado = 'sim' if cdcs_do_cpf else 'nao'
+            #cdc_list_str = '|'.join(sorted(cdcs_do_cpf)) if cdcs_do_cpf else ''
+            cdc_list_str = '|'.join(sorted(map(str, cdcs_do_cpf))) if cdcs_do_cpf else ''
+
+            # CEP e número do CSV para estimar CDC
             cep_csv = row.get('d.num_cep_logradouro_fam', '').strip() if 'd.num_cep_logradouro_fam' in row else ''
             numero_csv = row.get('d.num_logradouro_fam', '').strip() if 'd.num_logradouro_fam' in row else ''
 
-            # Verificar se CEP e número do imóvel foram fornecidos    
+            cdc_estimado = ''
+            cdc_match = 'nao'
+            cdc_cadastro_social = 'nao'
+            cdc_estimado_cadastro_social = 'nao'
+
+            # Estimar CDC via (CEP, Número)
             if cep_csv and numero_csv:
                 cep_numero_key = (cep_csv, numero_csv)
-                # Buscar CDC estimado usando CEP e número
                 cdc_estimado = cep_numero_to_cdc.get(cep_numero_key, '')
                 if cdc_estimado:
-                    if cdc_estimado == cdc: # Se o CDC estimado for igual ao CDC do SAAE atual
+                    if cdc_estimado in cdcs_do_cpf:
                         stats['cdc_match_count'] += 1
                         cdc_match = 'sim'
-                        cdc_to_cadastro_social[cdc] = True
+                        # marcar como cadastro social se aplicável
+                        if cdc_to_categoria.get(cdc_estimado, 0) == 11:
+                            cdc_to_cadastro_social[cdc_estimado] = True
                     else:
                         stats['cdcs_estimados_por_cep_numero'] += 1
             else:
                 stats['cep_numero_invalidos'] += 1
-            
-            # Atualizar estatísticas
-            if cdc:
+
+            # Atualizar estatísticas básicas de encontrado/não
+            if cdcs_do_cpf:
                 stats['cpfs_com_cdc_encontrado'] += 1
             else:
                 stats['cpfs_sem_cdc_encontrado'] += 1
                 if len(stats['cpfs_nao_encontrados_samples']) < 10:
                     stats['cpfs_nao_encontrados_samples'].add(cpf)
-            
-            # Obter categoria do CDC e CDC estimado
-            cod_cat_cdc = cdc_to_categoria.get(cdc, 0)
-            cod_cat_cdc_estimado = cdc_to_categoria.get(cdc_estimado, 0)
+
+            # Categorias
+            algum_cdc_social = any(cdc_to_categoria.get(c, 0) == 11 for c in cdcs_do_cpf)
+            cdc_cadastro_social = 'sim' if algum_cdc_social else 'nao'
+
+            if cdc_estimado:
+                cod_cat_cdc_estimado = cdc_to_categoria.get(cdc_estimado, 0)
+                cdc_estimado_e_social = (cod_cat_cdc_estimado == 11)
+                if cdc_estimado_e_social:
+                    cdc_estimado_cadastro_social = 'sim'
+                    stats['cdc_estimado_cadastro_social_count'] += 1
+            else:
+                cdc_estimado_e_social = False
+
+            # Definir STATUS (multi-CDC)
             status = "ANALISAR - NÃO ENCONTRADO"
-            
-            if cod_cat_cdc==11:
-                cdc_cadastro_social = 'sim'
-                stats['cdc_cadastro_social_count'] += 1
-                if cdc!=cdc_estimado:
-                    stats['cdc_cadastro_social_desatualizado_count'] += 1
-                else:   
-                    stats['cdc_cadastro_social_correto_count'] += 1
-            else:
-                if cdc==cdc_estimado and cdc_estimado!='':
-                    stats['cdc_incluir_cadastro_social_count'] += 1
-                    
-            if cod_cat_cdc_estimado==11:
-                cdc_estimado_cadastro_social = 'sim'
-                stats['cdc_estimado_cadastro_social_count'] += 1
-                
-            # Definir status
             if encontrado == 'sim':
-                if(cdc==cdc_estimado):
-                    if cod_cat_cdc==11:
-                        status = "CADASTRO SOCIAL CORRETO"
+                if cdc_estimado:
+                    if cdc_estimado in cdcs_do_cpf:
+                        if cdc_estimado_e_social:
+                            status = "CADASTRO SOCIAL CORRETO"
+                            stats['cdc_cadastro_social_correto_count'] += 1
+                        else:
+                            status = "INCLUIR CDC NO CADASTRO SOCIAL"
+                            stats['cdc_incluir_cadastro_social_count'] += 1
                     else:
-                        status = "INCLUIR CDC NO CADASTRO SOCIAL"
+                        status = "CPF ENCONTRADO. POREM ENDERECO DESATUALIZADO"
+                        if algum_cdc_social:
+                            stats['cdc_cadastro_social_desatualizado_count'] += 1
                 else:
-                    status = "CPF ENCONTRADO. POREM ENDERECO DESATUALIZADO"
+                    status = "CPF ENCONTRADO. SEM ESTIMATIVA DE ENDERECO"
             else:
-                 if(cdc_estimado!=''):
-                    if cod_cat_cdc_estimado==11:
+                if cdc_estimado:
+                    if cdc_estimado_e_social:
                         status = "ANALISAR - CPF NAO LOCALIZADO. POREM CDC_ESTIMADO JA POSSUI CADASTRO SOCIAL DO SAAE"
                     else:
                         status = "CPF NAO LOCALIZADO. CDC_ESTIMADO NAO POSSUI CADASTRO SOCIAL DO SAAE"
 
-            # Criar nova linha com os campos reordenados
+            # Nova linha de saída
             new_row = {
                 'STATUS': status,
-                'CDC': cdc,
-                'CADASTRO SOCIAL': cdc_cadastro_social,
+                'CDC': cdc_list_str,  # todos os CDCs do CPF (se houver)
                 'CPF_ENCONTRADO': encontrado,
+                'CADASTRO SOCIAL': cdc_cadastro_social,
                 'CDC_ESTIMADO': cdc_estimado,
                 'CADASTRO SOCIAL ESTIMADO': cdc_estimado_cadastro_social,
                 'CDC_CONFIRMADO': cdc_match
             }
-            # Adicionar os demais campos originais
             for field in reader.fieldnames:
-                new_row[field] = row[field]
-            
-            # Escrever no arquivo total
+                new_row[field] = row.get(field, '')
+
+            # Escrever arquivos
             total_writer.writerow(new_row)
-            
-            # Escrever nos arquivos específicos conforme as condições
             if cdc_match == 'sim':
                 match_writer.writerow(new_row)
-            
-            if cdc and cdc_estimado and cdc != cdc_estimado:
+            if cdcs_do_cpf and cdc_estimado and (cdc_estimado not in cdcs_do_cpf):
                 desatualizado_writer.writerow(new_row)
-            
-            if not cdc and cdc_estimado:
+            if not cdcs_do_cpf and cdc_estimado:
                 estimado_writer.writerow(new_row)
-            gravar_cpf_log(output_cpf_log, cpf, encontrado, cdc_match, cdc_cadastro_social, cdc_estimado_cadastro_social, cdc, cdc_estimado)
-            
-    
-    # Gerar arquivo de log detalhado
+
+            # Log por CPF
+            gravar_cpf_log(
+                output_cpf_log,
+                cpf,
+                encontrado,
+                cdc_match,
+                cdc_cadastro_social,
+                cdc_estimado_cadastro_social,
+                cdc_list_str,
+                cdc_estimado
+            )
+
+    # --- Geração do LOG detalhado ---
     log_file_path = output_file_path_total.replace('.csv', '_log.txt')
     with open(log_file_path, 'w', encoding='utf-8') as log_file:
         log_file.write(f"=== LOG DE PROCESSAMENTO - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
@@ -360,45 +381,55 @@ def process_csv_with_oracle_data(csv_file_path, output_file_path_total):
         log_file.write(f"Arquivo de saída com CDCs desatualizados: {output_cdc_desatualizado}\n")
         log_file.write(f"Arquivo de saída com CDCs estimados: {output_cdc_estimado}\n\n")
         log_file.write(f"Arquivo de log de CPFs: {output_cpf_log}\n\n")
-        
+
         log_file.write("=== ESTATÍSTICAS GERAIS ===\n")
         log_file.write(f"Total de CPFs processados no CSV: {stats['total_cpfs_no_csv']}\n")
-        log_file.write(f"CPFs com CDC encontrado: {stats['cpfs_com_cdc_encontrado']} ({stats['cpfs_com_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})\n")
-        log_file.write(f"CPFs sem CDC encontrado: {stats['cpfs_sem_cdc_encontrado']} ({stats['cpfs_sem_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})\n")
+        if stats['total_cpfs_no_csv']:
+            log_file.write(f"CPFs com CDC encontrado: {stats['cpfs_com_cdc_encontrado']} ({stats['cpfs_com_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})\n")
+            log_file.write(f"CPFs sem CDC encontrado: {stats['cpfs_sem_cdc_encontrado']} ({stats['cpfs_sem_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})\n")
+        else:
+            log_file.write("CPFs com CDC encontrado: 0 (0.00%)\n")
+            log_file.write("CPFs sem CDC encontrado: 0 (0.00%)\n")
+
         log_file.write(f"CDC Match SAAE e Cadunico: {stats['cdc_match_count']}\n")
         log_file.write(f"CDCs únicos encontrados: {stats['cdcs_unicos_encontrados']}\n")
         log_file.write(f"Total de relacionamentos CPF-CDC encontrados: {stats['total_relacionamentos_cpf_cdc']}\n")
         log_file.write(f"CDCs estimados por CEP+NÚMERO: {stats['cdcs_estimados_por_cep_numero']}\n\n")
-        
+
         log_file.write("=== AMOSTRAS PARA DIAGNÓSTICO ===\n")
         log_file.write("\n10 CPFs encontrados no Oracle (amostra):\n")
         for cpf in stats['cpfs_oracle_samples']:
             log_file.write(f"{cpf}\n")
-        
+
         log_file.write("\n10 CPFs do CSV não encontrados no Oracle (amostra):\n")
         for cpf in stats['cpfs_nao_encontrados_samples']:
             log_file.write(f"{cpf}\n")
-        
+
         log_file.write("\n=== DISTRIBUIÇÃO DE CPFs POR CDC ===\n")
-        for cdc, count in sorted(stats['cdc_count'].items(), key=lambda x: x[1], reverse=True)[:20]:  # Mostra os top 20
+        for cdc, count in sorted(stats['cdc_count'].items(), key=lambda x: x[1], reverse=True)[:20]:
             log_file.write(f"CDC {cdc}: {count} CPF(s) associado(s)\n")
-    
+
+    # --- Log da base SAAE (cadastro social por CDC) ---
     gravar_cadastro_social_saae_log(output_base_saae_social, cdc_to_cadastro_social)
 
+    # --- Resumo no console ---
     print(f"\n=== RESUMO ESTATÍSTICO ===")
     print(f"Total de CPFs processados: {stats['total_cpfs_no_csv']}")
-    print(f"CPFs com CDC encontrado: {stats['cpfs_com_cdc_encontrado']} ({stats['cpfs_com_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})")
-    print(f"CPFs sem CDC encontrado: {stats['cpfs_sem_cdc_encontrado']} ({stats['cpfs_sem_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})")
+    if stats['total_cpfs_no_csv']:
+        print(f"CPFs com CDC encontrado: {stats['cpfs_com_cdc_encontrado']} ({stats['cpfs_com_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})")
+        print(f"CPFs sem CDC encontrado: {stats['cpfs_sem_cdc_encontrado']} ({stats['cpfs_sem_cdc_encontrado']/stats['total_cpfs_no_csv']:.2%})")
+    else:
+        print("CPFs com CDC encontrado: 0 (0.00%)")
+        print("CPFs sem CDC encontrado: 0 (0.00%)")
     print(f"CDC Match SAAE e Cadunico: {stats['cdc_match_count']}")
-    print(f"Total de CDC com cadastro social: {stats['cdc_cadastro_social_count']} ({stats['cdc_cadastro_social_count']/stats['total_cpfs_no_csv']:.2%})")
-    print(f"Total de CDC Estimados com cadastro social: {stats['cdc_estimado_cadastro_social_count']} ({stats['cdc_estimado_cadastro_social_count']/stats['total_cpfs_no_csv']:.2%})")
+    print(f"Total de CDC Estimados com cadastro social: {stats['cdc_estimado_cadastro_social_count']}")
     print(f"CDCs únicos encontrados: {stats['cdcs_unicos_encontrados']}")
     print(f"CDCs estimados por CEP+NÚMERO: {stats['cdcs_estimados_por_cep_numero']}")
     print(f"\nArquivo processado com sucesso. Resultado salvo em: {output_file_path_total}")
     print(f"Arquivo de log detalhado gerado em: {log_file_path}")
     print(f"Arquivo de log pelo CPF gerado em: {output_cpf_log}")
-    
-    # Sugestões de diagnóstico baseadas nos resultados
+
+    # Sugestões de diagnóstico
     if stats['cpfs_com_cdc_encontrado'] == 0:
         print("\n=== SUGESTÕES PARA DIAGNÓSTICO ===")
         print("1. Verifique se os CPFs do CSV e do Oracle estão no mesmo formato")
